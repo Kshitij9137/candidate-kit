@@ -1,0 +1,1490 @@
+
+======================================================================
+FILE: DATA_MODEL.md
+======================================================================
+# DATA_MODEL.md: what is stored in MongoDB
+
+This file describes the two collections the grader **seeds directly into MongoDB**. Your code must read them exactly as
+described here, and what your code writes must look the same. The HTTP contract and the business rules (R1 - R10) live in
+`openapi.yaml`; this file refers to rules by number and does not repeat them.
+
+| | |
+|---|---|
+| Database | the name in `MONGO_DB` |
+| Collections | `employees`, `attendance_logs` |
+| Indexes | **None** except the default `_id` index. Creating the ones you need, at startup, is your job. |
+
+## 1. Types at a glance
+
+| Kind of value | In MongoDB | In the HTTP API |
+|---|---|---|
+| An instant (a punch, a creation time, a history time) | BSON date (datetime, UTC) | integer epoch **milliseconds** |
+| A calendar date (`date`, `joined_on`) | string `"YYYY-MM-DD"` | the same string |
+| A time of day (`shift_start`, `shift_end`) | string `"HH:MM"`, 24-hour, IST | the same string |
+| A duration | `work_hours` double, minutes as ints | the same numbers |
+
+Calendar dates and times of day are plain strings **on purpose**: a date is not an instant, and turning it into one forces
+a time zone on it. Instants are real datetimes in MongoDB, and your code is responsible for converting them to and from
+epoch milliseconds at the API boundary. By default PyMongo returns **naive** datetimes (no time zone); decide how you
+will handle that.
+
+## 2. `employees`
+
+One document per employee.
+
+| Field | Type | Notes |
+|---|---|---|
+| `_id` | ObjectId | **Internal to MongoDB.** Never accepted or returned by the API; do not use it to identify employees. |
+| `emp_code` | string | **The employee's identifier everywhere in this assignment.** A customer-generated business code assigned by the customer's HR team, for example `EMP0001`. It must be unique and never changes. It is **not** the `_id`. |
+| `name` | string | |
+| `email` | string | |
+| `department` | string | Case-sensitive. |
+| `shift_start` | string `"HH:MM"` | IST. Start of the employee's shift. |
+| `shift_end` | string `"HH:MM"` | IST. If `shift_end` <= `shift_start`, the shift is overnight (see R1). |
+| `joined_on` | string `"YYYY-MM-DD"` | First day of employment (see R7, R9). |
+| `created_at` | BSON date | When the record was created. Set by the API when it creates an employee; never supplied by a client. |
+
+Sample:
+```json
+{
+  "emp_code": "EMP0001",
+  "name": "Asha Rao",
+  "email": "asha@example.com",
+  "department": "Engineering",
+  "shift_start": "09:30",
+  "shift_end": "18:30",
+  "joined_on": "2026-01-05",
+  "created_at": {
+    "$date": "2026-01-05T04:30:00Z"
+  }
+}
+```
+
+## 3. `attendance_logs`
+
+At most **one document per (`emp_code`, `date`)**. `emp_code` points at `employees.emp_code`. There is no ObjectId reference.
+
+| Field | Type | Notes |
+|---|---|---|
+| `_id` | ObjectId | Internal. Not part of the API; a record is addressed by (`emp_code`, `date`). |
+| `emp_code` | string | The employee. |
+| `date` | string `"YYYY-MM-DD"` | The **attendance day**, an IST calendar date, defined by R1. For an overnight shift it is the day the shift started. |
+| `status` | string | Exactly one of the five values in the status table below. |
+| `punch_in` | BSON date or null | Set at punch-in. Null (or missing) for `ABSENT` / `LEAVE`. |
+| `punch_out` | BSON date or null | Null until the employee punches out. |
+| `work_hours` | double or null | **Computed by the API**, never supplied by a client (R4). Null until `punch_out` exists. |
+| `late_minutes` | int | **Computed by the API** at punch-in (R2). Missing means 0. |
+| `overtime_minutes` | int | **Computed by the API** at punch-out (R3). Missing means 0. |
+| `half_day` | bool | **Computed by the API** at punch-out (R5). Missing means false. |
+| `history` | array | Audit trail of manual corrections. See section 4. Missing means empty. |
+
+### Status values
+
+| `status` | Meaning | Punch times | Counts as present (R6) | Who creates it |
+|---|---|---|---|---|
+| `PRESENT` | Worked on site | `punch_in` required | yes | Punch-in |
+| `WFH` | Worked from home | `punch_in` required | yes | Punch-in |
+| `ON_DUTY` | Official duty away from the office | `punch_in` required | yes | Punch-in |
+| `ABSENT` | Did not work, not on approved leave | both null | no | Seeded back-office data, or a correction |
+| `LEAVE` | On approved leave | both null | no | Seeded back-office data, or a correction |
+
+No endpoint creates `ABSENT` or `LEAVE` records. A weekday with **no document at all** is different from an `ABSENT`
+document; the day has simply not been recorded.
+
+### Stored derived values are authoritative
+
+`work_hours`, `late_minutes`, `overtime_minutes` and `half_day` are written by the API, and only by the API, when it
+punches in, punches out or corrects a record. Analytics must **read the stored values** and not recompute them from the
+punch times. In the grader's seeded data the stored values are what the analytics are defined over.
+
+For a record your own code writes:
+
+| Situation | `work_hours` | `late_minutes` | `overtime_minutes` | `half_day` |
+|---|---|---|---|---|
+| presence status, no `punch_out` yet | null | from R2 | 0 | false |
+| presence status, with `punch_out` | R4 | from R2 | R3 | R5 |
+| `ABSENT` or `LEAVE` | null | 0 | 0 | false |
+
+## 4. `history`: the audit trail
+
+`history` records **manual corrections only** (regularizations). Punch-in and punch-out are the original events and never
+write to it. Each correction appends exactly one entry; entries are never edited or removed.
+
+| Field | Type | Notes |
+|---|---|---|
+| `at` | BSON date | When the correction was made. |
+| `by` | string | Who made it (free text, no authentication in this assignment). |
+| `reason` | string | Why. |
+| `changes` | object | One key per field that **actually changed**, each `{ "from": ..., "to": ... }`. Keys can be `status`, `punch_in`, `punch_out`, `work_hours`, `late_minutes`, `overtime_minutes`, `half_day`. |
+
+In MongoDB the `from` / `to` values of `punch_in` and `punch_out` are BSON dates, like the fields themselves. In the API they
+are epoch milliseconds. This is easy to forget because the dates sit inside a nested object.
+
+## 5. Sample documents
+
+The files in `sample_data/` hold these documents as MongoDB Extended JSON, so you can load them with
+`python sample_seed.py` or `mongoimport --jsonArray` (`_id` is omitted; MongoDB generates it).
+
+**They show the shapes only.** The grader's dataset is much larger and contains cases that these nine do not (ties, weekend
+records, employees with no logs at all, people who join mid-month, and more). Passing on this sample proves nothing about
+the analytics.
+
+### 1. Normal full day
+Punched in 09:28 IST, out 18:35 IST. Inside grace, overtime 5 min is under the 30-minute minimum.
+
+```json
+{
+  "emp_code": "EMP0001",
+  "date": "2026-07-06",
+  "status": "PRESENT",
+  "punch_in": {
+    "$date": "2026-07-06T03:58:00Z"
+  },
+  "punch_out": {
+    "$date": "2026-07-06T13:05:00Z"
+  },
+  "work_hours": 9.12,
+  "late_minutes": 0,
+  "overtime_minutes": 0,
+  "half_day": false,
+  "history": []
+}
+```
+
+### 2. Late, with overtime
+Punched in 10:05 IST (35 min after a 09:30 shift start), out 19:10 IST (40 min after shift end).
+
+```json
+{
+  "emp_code": "EMP0003",
+  "date": "2026-07-06",
+  "status": "PRESENT",
+  "punch_in": {
+    "$date": "2026-07-06T04:35:00Z"
+  },
+  "punch_out": {
+    "$date": "2026-07-06T13:40:00Z"
+  },
+  "work_hours": 9.08,
+  "late_minutes": 35,
+  "overtime_minutes": 40,
+  "half_day": false,
+  "history": []
+}
+```
+
+### 3. Open record (not punched out yet)
+`punch_out` is null, so `work_hours` is null and the other derived fields are at their defaults.
+
+```json
+{
+  "emp_code": "EMP0006",
+  "date": "2026-07-07",
+  "status": "PRESENT",
+  "punch_in": {
+    "$date": "2026-07-07T04:05:00Z"
+  },
+  "punch_out": null,
+  "work_hours": null,
+  "late_minutes": 0,
+  "overtime_minutes": 0,
+  "half_day": false,
+  "history": []
+}
+```
+
+### 4. Half day, work from home
+3.5 hours worked (< 4.50), so `half_day` is true. Counts as 0.5 of a present day.
+
+```json
+{
+  "emp_code": "EMP0004",
+  "date": "2026-07-07",
+  "status": "WFH",
+  "punch_in": {
+    "$date": "2026-07-07T04:00:00Z"
+  },
+  "punch_out": {
+    "$date": "2026-07-07T07:30:00Z"
+  },
+  "work_hours": 3.5,
+  "late_minutes": 0,
+  "overtime_minutes": 0,
+  "half_day": true,
+  "history": []
+}
+```
+
+### 5. Absent
+No punch times. Not counted as present.
+
+```json
+{
+  "emp_code": "EMP0004",
+  "date": "2026-07-08",
+  "status": "ABSENT",
+  "punch_in": null,
+  "punch_out": null,
+  "work_hours": null,
+  "late_minutes": 0,
+  "overtime_minutes": 0,
+  "half_day": false,
+  "history": []
+}
+```
+
+### 6. Leave
+No punch times. Not counted as present.
+
+```json
+{
+  "emp_code": "EMP0003",
+  "date": "2026-07-08",
+  "status": "LEAVE",
+  "punch_in": null,
+  "punch_out": null,
+  "work_hours": null,
+  "late_minutes": 0,
+  "overtime_minutes": 0,
+  "half_day": false,
+  "history": []
+}
+```
+
+### 7. Overnight shift (22:00 - 06:00)
+`date` is the day the shift **started** (2026-07-06) although the punch-out is on the 7th. Punch-in 21:55 IST, out 06:40 IST next day (40 min overtime).
+
+```json
+{
+  "emp_code": "EMP0005",
+  "date": "2026-07-06",
+  "status": "PRESENT",
+  "punch_in": {
+    "$date": "2026-07-06T16:25:00Z"
+  },
+  "punch_out": {
+    "$date": "2026-07-07T01:10:00Z"
+  },
+  "work_hours": 8.75,
+  "late_minutes": 0,
+  "overtime_minutes": 40,
+  "half_day": false,
+  "history": []
+}
+```
+
+### 8. Regularized record (has `history`)
+HR corrected the punch-in from 10:05 IST to 09:28 IST. The derived fields were recomputed and one history entry was appended (see section 4 of this document).
+
+```json
+{
+  "emp_code": "EMP0001",
+  "date": "2026-07-07",
+  "status": "PRESENT",
+  "punch_in": {
+    "$date": "2026-07-07T03:58:00Z"
+  },
+  "punch_out": {
+    "$date": "2026-07-07T13:00:00Z"
+  },
+  "work_hours": 9.03,
+  "late_minutes": 0,
+  "overtime_minutes": 0,
+  "half_day": false,
+  "history": [
+    {
+      "at": {
+        "$date": "2026-07-08T05:00:00Z"
+      },
+      "by": "hr.admin",
+      "reason": "biometric glitch",
+      "changes": {
+        "punch_in": {
+          "from": {
+            "$date": "2026-07-07T04:35:00Z"
+          },
+          "to": {
+            "$date": "2026-07-07T03:58:00Z"
+          }
+        },
+        "late_minutes": {
+          "from": 35,
+          "to": 0
+        },
+        "work_hours": {
+          "from": 8.42,
+          "to": 9.03
+        }
+      }
+    }
+  ]
+}
+```
+
+### 9. Legacy record (no `history`, no `half_day`)
+Older records may omit these two fields entirely. Treat missing as an empty array / false.
+
+```json
+{
+  "emp_code": "EMP0002",
+  "date": "2026-07-14",
+  "status": "PRESENT",
+  "punch_in": {
+    "$date": "2026-07-14T04:02:00Z"
+  },
+  "punch_out": {
+    "$date": "2026-07-14T13:01:00Z"
+  },
+  "work_hours": 8.98,
+  "late_minutes": 0,
+  "overtime_minutes": 0
+}
+```
+
+======================================================================
+FILE: DECISIONS.md
+======================================================================
+# DECISIONS.md  (about 150-200 words in total - plain language, your own words)
+
+1. **Indexes.** Which indexes did you create, and which query or guarantee does each one serve? Which one did you consider and reject?
+2. **Punch-in race.** Two identical punch-in requests arrive at the same instant. Walk through exactly what happens in your code.
+3. **Ties.** Two employees are tied on late minutes at the cutoff of `limit`. What does your leaderboard return, and why?
+4. **Headcount.** How does your department summary make sure employees with zero logs are counted?
+5. **One thing you would change** if this had to serve 100x the data.
+
+======================================================================
+FILE: openapi.yaml
+======================================================================
+openapi: 3.0.3
+info:
+  title: Employee Attendance & Analytics API
+  version: 2.0.0
+  description: |
+    Contract for the HROne engineering assignment. Your FastAPI app must follow this document exactly: paths, methods,
+    parameter names, status codes and response field names. All code lives in `app/main.py` and must start with
+    `uvicorn app.main:app --port 8000`.
+
+    **Where things are defined.** This file defines the HTTP contract and the business rules R1-R10. What is stored in
+    MongoDB (collections, field types, what the grader seeds, nine sample documents) is defined in `DATA_MODEL.md`.
+
+    ## Configuration
+    `MONGO_URI` and `MONGO_DB` are read from environment variables (a local `.env` is fine; real environment variables
+    must win). Create all indexes at startup, idempotently.
+
+    ## Conventions used by every endpoint
+    * **Employees are identified by `emp_code`.** It is a customer-generated business code assigned by the customer's HR
+      team (this API does not generate it). It is unique, never changes, and is meant for humans. It is **not** MongoDB's
+      `_id`. `_id` is internal: it never appears in a request or a response. Attendance records have no id either; a
+      record is addressed by (`emp_code`, `date`).
+    * **Instants are epoch milliseconds.** Every point in time in a request or response (`punched_at`, `punch_in`,
+      `punch_out`, `created_at`, `history[].at`, and the time values inside `history[].changes`) is an integer count of
+      **milliseconds** since 1970-01-01T00:00:00Z. There is no time zone to get wrong. Values that look like seconds
+      (below 100000000000), floats, strings and out-of-range numbers are rejected with 422. MongoDB stores these as BSON
+      datetimes.
+    * **Calendar values are strings.** Dates are `YYYY-MM-DD` (an IST calendar date), months are `YYYY-MM`, shift times
+      are `HH:MM` (24-hour, IST).
+    * **Derived fields are read-only.** `work_hours`, `late_minutes`, `overtime_minutes` and `half_day` are computed by the
+      API from the punch times, the employee's shift and rules R2-R5. They never appear in a request body. If a client
+      sends one, ignore it.
+
+    ## Status values
+    | `status` | Meaning | Punch times | Counts as present (R6) | Created by |
+    |---|---|---|---|---|
+    | `PRESENT` | Worked on site | `punch_in` required | yes | punch-in |
+    | `WFH` | Worked from home | `punch_in` required | yes | punch-in |
+    | `ON_DUTY` | Official duty away from the office | `punch_in` required | yes | punch-in |
+    | `ABSENT` | Did not work, no approved leave | both null | no | seeded data, or a correction |
+    | `LEAVE` | On approved leave | both null | no | seeded data, or a correction |
+
+    No endpoint creates `ABSENT` or `LEAVE` records. A weekday with **no record at all** is different from an `ABSENT`
+    record.
+
+    ## Who computes what
+    | Field | Computed when | From |
+    |---|---|---|
+    | `late_minutes` | punch-in, and after every correction | `punch_in`, shift start (R2) |
+    | `work_hours`, `overtime_minutes`, `half_day` | punch-out, and after every correction | `punch_in`, `punch_out`, shift end (R3-R5) |
+    | `created_at` | employee creation | server clock |
+
+    For analytics, **read the stored derived values**; do not recompute them from the punch times.
+
+    ## History
+    `history` is the audit trail of **manual corrections only**. Punch-in and punch-out never write to it. Each
+    successful `PATCH` appends exactly one entry `{at, by, reason, changes}`: when (epoch ms), who (`regularized_by`),
+    why (`reason`), and for every field that **actually changed**, `{"from": ..., "to": ...}`. Entries are never edited or
+    removed. A record that has never been corrected has `history: []`.
+
+    ## Business rules (R1-R10) - these are NOT visible in the schemas below
+    * **R1 Time zone and attendance date.** Shift times and attendance dates are IST (UTC+05:30). A record's `date` is the
+      IST calendar date of its `punch_in` instant. Exception - overnight shifts (`shift_end` <= `shift_start`, e.g.
+      22:00-06:00): a punch-in whose IST time is *earlier than* `shift_end` belongs to the shift that started the previous
+      day. The shift end of an overnight shift falls on the next calendar day. Before any calculation, instants are
+      truncated to whole seconds (09:40:00.900 counts as 09:40:00), and the truncated value is what is stored and returned.
+    * **R2 Late.** Grace period is 10 minutes. A punch-in is late only if it is *strictly more than* 10:00 after
+      `shift_start`. When late, `late_minutes` = whole minutes (floor) elapsed since `shift_start` - not since the end of
+      the grace period. Otherwise 0. Example (shift 09:30): 09:40:00 -> 0; 09:40:01 -> 10; 10:15:59 -> 45.
+    * **R3 Overtime.** `overtime_minutes` = whole minutes (floor) between `shift_end` and `punch_out`, counted only when
+      that is >= 30; otherwise 0.
+    * **R4 Work hours.** (`punch_out` - `punch_in`) in seconds / 3600, rounded to 2 decimals **half-up** (not banker's
+      rounding, not float rounding). `null` until punch-out.
+    * **R5 Half day.** After punch-out, `half_day` = true when the **rounded** `work_hours` < 4.50. A half day counts
+      as 0.5 of a present day.
+    * **R6 Presence.** `PRESENT`, `WFH` and `ON_DUTY` count as present. `ABSENT` and `LEAVE` do not.
+    * **R7 Working days.** Mon-Fri, no holiday calendar. For an employee who joined mid-month, working days are counted
+      from `joined_on`. `present_days` only counts records that fall on Mon-Fri (weekend records still contribute to
+      late and overtime totals).
+    * **R8 Rounding of reported numbers.** 2 decimals half-up (rates: 4 decimals half-up).
+    * **R9 Headcount.** Employees whose `joined_on` is on or before the end of the period (the last day of the month, or
+      the given day for the trend), whether or not they have any logs.
+    * **R10 Pagination.** `page` starts at 1. `page_size` max is 100 (default 20). `total` always reflects the applied filters.
+
+    ## Errors
+    Errors use FastAPI's default body, `{"detail": ...}`. Validation failures are 422.
+  contact:
+    name: HROne Engineering
+tags:
+  - name: system
+  - name: employees
+  - name: attendance
+  - name: analytics
+  - name: admin
+paths:
+  /health:
+    get:
+      tags: [system]
+      operationId: health
+      summary: Readiness probe
+      description: Returns 200 only if MongoDB answers a ping, otherwise 503. The runner polls this before testing.
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: {type: string, enum: [ok]}
+        '503': {$ref: '#/components/responses/Error'}
+  /employees:
+    post:
+      tags: [employees]
+      operationId: createEmployee
+      summary: Create an employee
+      description: |
+        The client supplies `emp_code` (the customer's own code). It must be unique, **enforced by a database unique
+        index** (concurrent duplicate creates must yield exactly one 201 and the rest 409). `shift_start` must differ
+        from `shift_end`. `created_at` is set by the server. There is no endpoint to change an `emp_code`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EmployeeCreate'}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Employee'}
+        '409': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+    get:
+      tags: [employees]
+      operationId: listEmployees
+      summary: List employees
+      description: Sorted by `emp_code` ascending. `total` counts the filtered set, not the whole collection.
+      parameters:
+        - name: department
+          in: query
+          required: false
+          schema: {type: string}
+          description: Exact, case-sensitive match.
+        - {$ref: '#/components/parameters/Page'}
+        - {$ref: '#/components/parameters/PageSize'}
+      responses:
+        '200':
+          description: A page of employees
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EmployeePage'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /attendance/punch-in:
+    post:
+      tags: [attendance]
+      operationId: punchIn
+      summary: Record a punch-in
+      description: |
+        Creates the day's record. `date` follows R1 and `late_minutes` follows R2; `punch_out` and `work_hours` start as
+        `null`, `overtime_minutes` as 0, `half_day` as false, `history` as `[]`. If `punched_at` is omitted, use the
+        current time. `status` defaults to `PRESENT`; only `PRESENT`, `WFH` and `ON_DUTY` are accepted here.
+        **Concurrency:** if the same employee punches in twice for the same attendance date at the same moment,
+        exactly one request gets 201 and the rest get 409. Do not rely on check-then-insert.
+        Errors: 404 unknown employee; 409 already punched in for that date; 422 invalid body.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PunchInRequest'}
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttendanceRecord'}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /attendance/punch-out:
+    post:
+      tags: [attendance]
+      operationId: punchOut
+      summary: Record a punch-out
+      description: |
+        Closes the employee's most recent record whose `punch_in` is at or before `punched_at` (this must work across
+        midnight for overnight shifts). Computes `work_hours` (R4), `overtime_minutes` (R3) and `half_day` (R5).
+        Errors: 404 unknown employee, or no punch-in found; 409 that record is already punched out (two simultaneous
+        punch-outs must yield exactly one 200); 422 if `punched_at` <= `punch_in` or more than 24 hours after it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PunchOutRequest'}
+      responses:
+        '200':
+          description: Updated record
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttendanceRecord'}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /attendance:
+    get:
+      tags: [attendance]
+      operationId: listAttendance
+      summary: List attendance records
+      description: |
+        Sorted by `date` descending, then `emp_code` ascending. Must stay fast on a collection of ~100,000 records;
+        do not load the collection into memory. `date_from`/`date_to` are inclusive; `date_from` > `date_to` -> 422.
+      parameters:
+        - {name: emp_code, in: query, required: false, schema: {type: string}}
+        - {name: date_from, in: query, required: false, schema: {type: string, format: date}}
+        - {name: date_to, in: query, required: false, schema: {type: string, format: date}}
+        - {name: status, in: query, required: false, schema: {$ref: '#/components/schemas/Status'}}
+        - {$ref: '#/components/parameters/Page'}
+        - {$ref: '#/components/parameters/PageSize'}
+      responses:
+        '200':
+          description: A page of records
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttendancePage'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /attendance/{emp_code}/{date}:
+    patch:
+      tags: [attendance]
+      operationId: regularizeAttendance
+      summary: Regularize (manually correct) one day's record
+      description: |
+        The record is addressed by its natural key: the employee's `emp_code` and the attendance `date`
+        (`YYYY-MM-DD`, the record's `date` field).
+        Omitted fields are unchanged. After applying the change, **recompute** `late_minutes`, `work_hours`,
+        `overtime_minutes` and `half_day` from the final times (R2-R5) and **append** one entry to `history` (never
+        overwrite it); see "History" above. `history[].changes` contains only the fields that actually changed.
+        Rules: setting status `ABSENT` or `LEAVE` clears both punch times, so supplying `punch_in` or `punch_out` with it
+        is 422; a presence status requires a `punch_in` (supplied or already stored); `punch_in` must stay on the record's
+        attendance date (R1); `punch_out` must be after `punch_in` and within 24 hours; a request that changes nothing
+        is 422. 404 if the employee does not exist or has no record for that date. Concurrent edits must not silently
+        lose each other's history (409 is acceptable for the loser).
+      parameters:
+        - {name: emp_code, in: path, required: true, schema: {type: string}}
+        - {name: date, in: path, required: true, schema: {type: string, format: date}, description: "The record's attendance date, YYYY-MM-DD."}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RegularizeRequest'}
+      responses:
+        '200':
+          description: Updated record
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttendanceRecord'}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /analytics/employees/{emp_code}/monthly:
+    get:
+      tags: [analytics]
+      operationId: employeeMonthly
+      summary: Monthly attendance summary for one employee
+      description: |
+        Backed by a MongoDB aggregation. `working_days` per R7. `present_days` per R5-R7 (half day = 0.5, Mon-Fri only).
+        `leave_days` = number of `LEAVE` records. `late_count` = records with `late_minutes` > 0.
+        `attendance_pct` = `present_days` / `working_days` x 100, R8 rounding, or `null` when `working_days` is 0.
+        404 for an unknown employee.
+      parameters:
+        - {name: emp_code, in: path, required: true, schema: {type: string}}
+        - {$ref: '#/components/parameters/Month'}
+      responses:
+        '200':
+          description: Summary
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EmployeeMonthly'}
+        '404': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /analytics/departments/summary:
+    get:
+      tags: [analytics]
+      operationId: departmentSummary
+      summary: Department summary for a month
+      description: |
+        One item per department, sorted by `department` ascending, via a MongoDB aggregation across both collections.
+        * `headcount` per R9 - **people with zero logs still count**, people who join later do not.
+        * `present_days` as in the employee summary, summed over the department.
+        * `avg_work_hours` = mean `work_hours` over records that are present-status **and** have a `work_hours` value
+          (average over records, not an average of per-employee averages); `null` if there are none. R8 rounding.
+        * `late_count` = records with `late_minutes` > 0; `total_late_minutes` = their sum.
+        * `leave_count` = `LEAVE` records; `on_duty_count` = `ON_DUTY` records.
+        A department whose headcount is 0 for the month is omitted. Department comes from the `employees` collection.
+      parameters:
+        - {$ref: '#/components/parameters/Month'}
+        - name: department
+          in: query
+          required: false
+          schema: {type: string}
+          description: Restrict to one department (exact match).
+      responses:
+        '200':
+          description: Summary
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DepartmentSummary'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /analytics/leaderboard/late:
+    get:
+      tags: [analytics]
+      operationId: lateLeaderboard
+      summary: Late-comers leaderboard for a month
+      description: |
+        Ranks employees by total `late_minutes` in the month (only employees with a total > 0), highest first.
+        * **Ranking is standard competition ranking** - ties share a rank and the next rank is skipped
+          (e.g. 1, 2, 2, 4). Do not use the array position as the rank.
+        * `limit` applies **after** ranking: return every employee whose `rank` <= `limit`. The response can therefore
+          contain more than `limit` rows when employees tie at a rank <= `limit`.
+        * Order of rows: `total_late_minutes` descending, then `emp_code` ascending.
+        * When `department` is given, ranking happens inside that department only.
+        `name` and `department` come from `employees`; logs whose employee does not exist are ignored.
+      parameters:
+        - {$ref: '#/components/parameters/Month'}
+        - {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 50, default: 10}}
+        - {name: department, in: query, required: false, schema: {type: string}}
+      responses:
+        '200':
+          description: Leaderboard
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Leaderboard'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /analytics/departments/{department}/trend:
+    get:
+      tags: [analytics]
+      operationId: departmentTrend
+      summary: Daily attendance trend for a department
+      description: |
+        Returns **exactly one row per calendar day** from `from` to `to` inclusive - weekends and days with no records
+        at all included (use a gap-filling stage such as `$densify`; do not loop in Python).
+        * `is_working_day` = Mon-Fri.
+        * `headcount` = department employees with `joined_on` <= that day (R9).
+        * `present_count` = presence-status records that day (half day = 0.5), any weekday or weekend.
+        * `late_count` = records that day with `late_minutes` > 0.
+        * `attendance_rate` = `present_count` / `headcount`, 4 decimals half-up, **only on working days with headcount > 0,
+          otherwise `null`**. A working day with no records has rate 0.0.
+        * `moving_avg_7d` = mean of the non-null `attendance_rate` values among the current row and up to 6 preceding rows
+          **inside the requested range** (rows before `from` are not considered, so the first rows use a shorter
+          window). `null` if the window holds no non-null rate. 4 decimals half-up.
+        Errors: 404 unknown department (no employees); 422 if `to` < `from` or the range exceeds 92 days.
+      parameters:
+        - {name: department, in: path, required: true, schema: {type: string}}
+        - {name: from, in: query, required: true, schema: {type: string, format: date}}
+        - {name: to, in: query, required: true, schema: {type: string, format: date}}
+      responses:
+        '200':
+          description: Trend
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Trend'}
+        '404': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /admin/explain/{endpoint}:
+    get:
+      tags: [admin]
+      operationId: explainEndpoint
+      summary: MongoDB explain for an endpoint's main query
+      description: |
+        Runs `explain` with `executionStats` verbosity for the **main query or aggregation of the named endpoint,
+        built exactly as that endpoint builds it** (same filters, sort, pagination), and returns the raw explain output.
+        Accepts the same query parameters as the endpoint it explains (for `department_trend` pass `department`,
+        `from`, `to`; for `employee_monthly` pass `emp_code`, `month`; etc.). Missing required parameters -> 422.
+        The grader checks that the plan contains `IXSCAN` and no `COLLSCAN`, on a ~100k-record dataset.
+      parameters:
+        - name: endpoint
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [attendance_list, employee_monthly, department_summary, late_leaderboard, department_trend]
+        - {name: emp_code, in: query, required: false, schema: {type: string}}
+        - {name: month, in: query, required: false, schema: {type: string, pattern: '^\d{4}-(0[1-9]|1[0-2])$'}}
+        - {name: department, in: query, required: false, schema: {type: string}}
+        - {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 50, default: 10}}
+        - {name: date_from, in: query, required: false, schema: {type: string, format: date}}
+        - {name: date_to, in: query, required: false, schema: {type: string, format: date}}
+        - {name: status, in: query, required: false, schema: {$ref: '#/components/schemas/Status'}}
+        - {name: from, in: query, required: false, schema: {type: string, format: date}}
+        - {name: to, in: query, required: false, schema: {type: string, format: date}}
+        - {$ref: '#/components/parameters/Page'}
+        - {$ref: '#/components/parameters/PageSize'}
+      responses:
+        '200':
+          description: Explain output
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [endpoint, collection, explain]
+                properties:
+                  endpoint: {type: string}
+                  collection: {type: string, description: Collection the explained operation ran on.}
+                  explain: {type: object, additionalProperties: true, description: Raw MongoDB explain document as JSON.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+components:
+  parameters:
+    Page:
+      name: page
+      in: query
+      required: false
+      schema: {type: integer, minimum: 1, default: 1}
+    PageSize:
+      name: page_size
+      in: query
+      required: false
+      schema: {type: integer, minimum: 1, maximum: 100, default: 20}
+    Month:
+      name: month
+      in: query
+      required: true
+      description: Calendar month, `YYYY-MM`.
+      schema: {type: string, pattern: '^\d{4}-(0[1-9]|1[0-2])$'}
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [detail]
+            properties:
+              detail: {type: string}
+    ValidationError:
+      description: Validation error (FastAPI default body)
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [detail]
+            properties:
+              detail: {type: array, items: {type: object, additionalProperties: true}}
+  schemas:
+    EpochMillis:
+      type: integer
+      format: int64
+      minimum: 100000000000
+      maximum: 4102444800000
+      description: |
+        An instant as milliseconds since 1970-01-01T00:00:00Z. Seconds-looking values (below 100000000000), floats and
+        strings are rejected with 422.
+      example: 1783312500000
+    EpochMillisNullable:
+      type: integer
+      format: int64
+      nullable: true
+      minimum: 100000000000
+      maximum: 4102444800000
+      description: An instant as epoch milliseconds, or null.
+      example: 1783312500000
+    Status:
+      type: string
+      enum: [PRESENT, ABSENT, LEAVE, WFH, ON_DUTY]
+      description: See the status table in the API description.
+    PresenceStatus:
+      type: string
+      enum: [PRESENT, WFH, ON_DUTY]
+    EmployeeCreate:
+      type: object
+      required: [emp_code, name, email, department, joined_on]
+      properties:
+        emp_code:
+          type: string
+          pattern: '^EMP\d{4,6}$'
+          example: EMP0001
+          description: |
+            The customer's own employee code, supplied by the client. Unique and immutable. Not MongoDB's `_id`.
+            Format for this assignment: `EMP` followed by 4-6 digits.
+        name: {type: string, minLength: 1, maxLength: 100}
+        email: {type: string, maxLength: 120, pattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'}
+        department: {type: string, minLength: 1, maxLength: 50}
+        shift_start: {type: string, pattern: '^([01]\d|2[0-3]):[0-5]\d$', default: '09:30', description: "24-hour HH:MM, IST."}
+        shift_end: {type: string, pattern: '^([01]\d|2[0-3]):[0-5]\d$', default: '18:30', description: "24-hour HH:MM, IST. <= shift_start means an overnight shift."}
+        joined_on: {type: string, format: date, description: "First day of employment, YYYY-MM-DD."}
+    Employee:
+      type: object
+      required: [emp_code, name, email, department, shift_start, shift_end, joined_on, created_at]
+      properties:
+        emp_code: {type: string, description: "The customer-generated employee code. Unique, immutable. Not the MongoDB _id."}
+        name: {type: string}
+        email: {type: string}
+        department: {type: string}
+        shift_start: {type: string}
+        shift_end: {type: string}
+        joined_on: {type: string, format: date}
+        created_at:
+          readOnly: true
+          allOf:
+            - {$ref: '#/components/schemas/EpochMillis'}
+          description: Server-set creation time, epoch milliseconds.
+    EmployeePage:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Employee'}}
+        total: {type: integer}
+        page: {type: integer}
+        page_size: {type: integer}
+    PunchInRequest:
+      type: object
+      required: [emp_code]
+      properties:
+        emp_code: {type: string}
+        punched_at:
+          allOf:
+            - {$ref: '#/components/schemas/EpochMillis'}
+          description: Epoch milliseconds. Defaults to now.
+        status:
+          allOf:
+            - {$ref: '#/components/schemas/PresenceStatus'}
+          default: PRESENT
+    PunchOutRequest:
+      type: object
+      required: [emp_code]
+      properties:
+        emp_code: {type: string}
+        punched_at:
+          allOf:
+            - {$ref: '#/components/schemas/EpochMillis'}
+          description: Epoch milliseconds. Defaults to now.
+    RegularizeRequest:
+      type: object
+      required: [reason, regularized_by]
+      description: Only these fields can be changed. Derived fields can not be sent.
+      properties:
+        status: {$ref: '#/components/schemas/Status'}
+        punch_in: {$ref: '#/components/schemas/EpochMillis'}
+        punch_out: {$ref: '#/components/schemas/EpochMillis'}
+        reason: {type: string, minLength: 5, maxLength: 200}
+        regularized_by: {type: string, minLength: 1, maxLength: 50}
+    HistoryEntry:
+      type: object
+      required: [at, by, reason, changes]
+      properties:
+        at: {$ref: '#/components/schemas/EpochMillis'}
+        by: {type: string}
+        reason: {type: string}
+        changes:
+          type: object
+          description: |
+            One key per field that actually changed (`status`, `punch_in`, `punch_out`, `work_hours`, `late_minutes`,
+            `overtime_minutes`, `half_day`). The `from` / `to` values of `punch_in` and `punch_out` are epoch
+            milliseconds (or null); the others keep their normal types.
+          additionalProperties:
+            type: object
+            properties:
+              from: {nullable: true}
+              to: {nullable: true}
+          example:
+            punch_in: {from: 1783312500000, to: 1783310280000}
+            late_minutes: {from: 35, to: 0}
+    AttendanceRecord:
+      type: object
+      required: [emp_code, date, status, punch_in, punch_out, work_hours, late_minutes, overtime_minutes, half_day, history]
+      properties:
+        emp_code: {type: string}
+        date: {type: string, format: date, description: "The attendance day (R1), YYYY-MM-DD."}
+        status: {$ref: '#/components/schemas/Status'}
+        punch_in: {$ref: '#/components/schemas/EpochMillisNullable'}
+        punch_out: {$ref: '#/components/schemas/EpochMillisNullable'}
+        work_hours: {type: number, nullable: true, readOnly: true, description: Computed (R4). Null until punch-out.}
+        late_minutes: {type: integer, readOnly: true, description: Computed (R2).}
+        overtime_minutes: {type: integer, readOnly: true, description: Computed (R3).}
+        half_day: {type: boolean, readOnly: true, description: Computed (R5).}
+        history: {type: array, items: {$ref: '#/components/schemas/HistoryEntry'}}
+    AttendancePage:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/AttendanceRecord'}}
+        total: {type: integer}
+        page: {type: integer}
+        page_size: {type: integer}
+    EmployeeMonthly:
+      type: object
+      required: [emp_code, month, working_days, present_days, leave_days, late_count, total_late_minutes, total_overtime_minutes, attendance_pct]
+      properties:
+        emp_code: {type: string}
+        month: {type: string}
+        working_days: {type: integer}
+        present_days: {type: number}
+        leave_days: {type: integer}
+        late_count: {type: integer}
+        total_late_minutes: {type: integer}
+        total_overtime_minutes: {type: integer}
+        attendance_pct: {type: number, nullable: true}
+    DepartmentSummary:
+      type: object
+      required: [month, items]
+      properties:
+        month: {type: string}
+        items:
+          type: array
+          items:
+            type: object
+            required: [department, headcount, present_days, avg_work_hours, late_count, total_late_minutes, leave_count, on_duty_count]
+            properties:
+              department: {type: string}
+              headcount: {type: integer}
+              present_days: {type: number}
+              avg_work_hours: {type: number, nullable: true}
+              late_count: {type: integer}
+              total_late_minutes: {type: integer}
+              leave_count: {type: integer}
+              on_duty_count: {type: integer}
+    Leaderboard:
+      type: object
+      required: [month, items]
+      properties:
+        month: {type: string}
+        items:
+          type: array
+          items:
+            type: object
+            required: [rank, emp_code, name, department, total_late_minutes, late_count]
+            properties:
+              rank: {type: integer, minimum: 1}
+              emp_code: {type: string}
+              name: {type: string}
+              department: {type: string}
+              total_late_minutes: {type: integer}
+              late_count: {type: integer}
+    Trend:
+      type: object
+      required: [department, items]
+      properties:
+        department: {type: string}
+        items:
+          type: array
+          items:
+            type: object
+            required: [date, is_working_day, headcount, present_count, late_count, attendance_rate, moving_avg_7d]
+            properties:
+              date: {type: string, format: date}
+              is_working_day: {type: boolean}
+              headcount: {type: integer}
+              present_count: {type: number}
+              late_count: {type: integer}
+              attendance_rate: {type: number, nullable: true}
+              moving_avg_7d: {type: number, nullable: true}
+
+======================================================================
+FILE: README.md
+======================================================================
+# Candidate kit
+
+Read in this order:
+
+1. `PROBLEM_STATEMENT.docx`: what you are asked to do, how it is evaluated.
+2. `openapi.yaml`: the API contract and the business rules (R1 - R10).
+3. `DATA_MODEL.md`: what is stored in MongoDB, with nine sample documents.
+4. `app/main.py`: the starter. Put **all** your code in this one file. It must start with `uvicorn app.main:app --port 8000`.
+5. `REVIEW.md`, `DECISIONS.md`: templates to fill in.
+
+`sample_data/` holds the nine sample documents as MongoDB Extended JSON; `sample_seed.py` loads them. The grader's dataset is
+much larger and contains cases they do not show.
+
+## Local setup
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env            # set MONGO_URI / MONGO_DB (local docker: docker run -p 27017:27017 mongo:7)
+python sample_seed.py
+uvicorn app.main:app --port 8000 --reload
+```
+MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free tier (M0) works.
+
+## Submit
+A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
+No `.env`, no secrets, no Dockerfile.
+
+======================================================================
+FILE: REVIEW.md
+======================================================================
+# REVIEW.md
+
+List every defect you found in the starter `app/main.py` (helpers and endpoints). For each one:
+
+| # | Where (function / line) | What is wrong | How you'd notice it (test, input, or symptom) | How you fixed it |
+|---|---|---|---|---|
+| 1 | | | | |
+
+Also note anything you looked at and decided was **not** a defect, and why.
+
+======================================================================
+FILE: sample_seed.py
+======================================================================
+"""Loads the nine sample documents from sample_data/ (see DATA_MODEL.md) into your database.
+Usage:  python sample_seed.py            (reads MONGO_URI / MONGO_DB from the environment or .env)
+
+Equivalent with the MongoDB tools:
+  mongoimport --uri "$MONGO_URI" --db "$MONGO_DB" -c employees       --jsonArray --drop --file sample_data/employees.json
+  mongoimport --uri "$MONGO_URI" --db "$MONGO_DB" -c attendance_logs --jsonArray --drop --file sample_data/attendance_logs.json
+
+The samples show document SHAPES only. The grader uses a much larger hidden dataset with cases they do not show.
+Passing on this sample does not mean your analytics are correct - re-read the business rules."""
+import os
+import pathlib
+
+from bson import json_util
+from dotenv import load_dotenv
+from pymongo import MongoClient
+
+load_dotenv()
+here = pathlib.Path(__file__).parent / "sample_data"
+opts = json_util.JSONOptions(tz_aware=True)
+db = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"), tz_aware=True)[os.getenv("MONGO_DB", "attendance_db")]
+
+for name in ("employees", "attendance_logs"):
+    docs = json_util.loads((here / f"{name}.json").read_text(), json_options=opts)
+    db[name].delete_many({})
+    db[name].insert_many(docs)
+    print(f"loaded {len(docs):>2} documents into '{db.name}.{name}'")
+
+======================================================================
+FILE: app\main.py
+======================================================================
+"""
+Employee Attendance & Analytics API - STARTER
+
+Run:  uvicorn app.main:app --port 8000
+Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
+
+This file was written quickly by a colleague who has left the company. The happy path
+works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
+openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
+"""
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from pymongo import MongoClient
+
+load_dotenv()
+
+client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+db = client[os.getenv("MONGO_DB", "attendance_db")]
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
+    h, m = map(int, shift_start.split(":"))
+    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
+    minutes = int((punch_in - start).total_seconds() / 60)
+    return minutes if minutes > 10 else 0
+
+
+def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
+    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+
+
+def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
+    h, m = map(int, shift_end.split(":"))
+    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
+    return max(0, int((punch_out - end).total_seconds() / 60))
+
+
+# --------------------------------------------------------------------------- #
+# Models
+# --------------------------------------------------------------------------- #
+class EmployeeIn(BaseModel):
+    emp_code: str
+    name: str
+    email: str
+    department: str
+    shift_start: str = "09:30"
+    shift_end: str = "18:30"
+    joined_on: str
+
+
+class PunchInIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[int] = None
+    status: str = "PRESENT"
+
+
+# --------------------------------------------------------------------------- #
+# Endpoints provided
+# --------------------------------------------------------------------------- #
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/employees", status_code=201)
+def create_employee(body: EmployeeIn):
+    if db.employees.find_one({"emp_code": body.emp_code}):
+        raise HTTPException(409, "emp_code already exists")
+    doc = body.model_dump()
+    doc["created_at"] = datetime.now()
+    db.employees.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@app.get("/employees")
+def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+    q = {}
+    if department:
+        q["department"] = department
+    skip = page * page_size
+    total = db.employees.count_documents({})
+    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@app.post("/attendance/punch-in", status_code=201)
+def punch_in(body: PunchInIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
+    d = ts.date().isoformat()
+    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
+        raise HTTPException(409, "already punched in for this date")
+    doc = {
+        "emp_code": body.emp_code,
+        "date": d,
+        "status": body.status,
+        "punch_in": ts,
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    }
+    res = db.attendance_logs.insert_one(doc)
+    doc["id"] = str(res.inserted_id)
+    doc.pop("_id", None)
+    return doc
+
+
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+):
+    q = {}
+    if emp_code:
+        q["emp_code"] = emp_code
+    if date_from or date_to:
+        q["date"] = {}
+        if date_from:
+            q["date"]["$gte"] = date_from
+        if date_to:
+            q["date"]["$lte"] = date_to
+    if status:
+        q["status"] = status
+    docs = list(db.attendance_logs.find(q))
+    docs.sort(key=lambda d: d["date"], reverse=True)
+    total = len(docs)
+    page_docs = docs[(page - 1) * page_size : page * page_size]
+    for d in page_docs:
+        d["id"] = str(d.pop("_id"))
+    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+
+
+# --------------------------------------------------------------------------- #
+# TODO - the rest of the contract (see openapi.yaml):
+#   POST  /attendance/punch-out
+#   PATCH /attendance/{emp_code}/{date}
+#   GET   /analytics/employees/{emp_code}/monthly
+#   GET   /analytics/departments/summary
+#   GET   /analytics/leaderboard/late
+#   GET   /analytics/departments/{department}/trend
+#   GET   /admin/explain/{endpoint}
+# --------------------------------------------------------------------------- #
+
+======================================================================
+FILE: app\__init__.py
+======================================================================
+
+======================================================================
+FILE: sample_data\attendance_logs.json
+======================================================================
+[
+  {
+    "emp_code": "EMP0001",
+    "date": "2026-07-06",
+    "status": "PRESENT",
+    "punch_in": {
+      "$date": "2026-07-06T03:58:00Z"
+    },
+    "punch_out": {
+      "$date": "2026-07-06T13:05:00Z"
+    },
+    "work_hours": 9.12,
+    "late_minutes": 0,
+    "overtime_minutes": 0,
+    "half_day": false,
+    "history": []
+  },
+  {
+    "emp_code": "EMP0003",
+    "date": "2026-07-06",
+    "status": "PRESENT",
+    "punch_in": {
+      "$date": "2026-07-06T04:35:00Z"
+    },
+    "punch_out": {
+      "$date": "2026-07-06T13:40:00Z"
+    },
+    "work_hours": 9.08,
+    "late_minutes": 35,
+    "overtime_minutes": 40,
+    "half_day": false,
+    "history": []
+  },
+  {
+    "emp_code": "EMP0006",
+    "date": "2026-07-07",
+    "status": "PRESENT",
+    "punch_in": {
+      "$date": "2026-07-07T04:05:00Z"
+    },
+    "punch_out": null,
+    "work_hours": null,
+    "late_minutes": 0,
+    "overtime_minutes": 0,
+    "half_day": false,
+    "history": []
+  },
+  {
+    "emp_code": "EMP0004",
+    "date": "2026-07-07",
+    "status": "WFH",
+    "punch_in": {
+      "$date": "2026-07-07T04:00:00Z"
+    },
+    "punch_out": {
+      "$date": "2026-07-07T07:30:00Z"
+    },
+    "work_hours": 3.5,
+    "late_minutes": 0,
+    "overtime_minutes": 0,
+    "half_day": true,
+    "history": []
+  },
+  {
+    "emp_code": "EMP0004",
+    "date": "2026-07-08",
+    "status": "ABSENT",
+    "punch_in": null,
+    "punch_out": null,
+    "work_hours": null,
+    "late_minutes": 0,
+    "overtime_minutes": 0,
+    "half_day": false,
+    "history": []
+  },
+  {
+    "emp_code": "EMP0003",
+    "date": "2026-07-08",
+    "status": "LEAVE",
+    "punch_in": null,
+    "punch_out": null,
+    "work_hours": null,
+    "late_minutes": 0,
+    "overtime_minutes": 0,
+    "half_day": false,
+    "history": []
+  },
+  {
+    "emp_code": "EMP0005",
+    "date": "2026-07-06",
+    "status": "PRESENT",
+    "punch_in": {
+      "$date": "2026-07-06T16:25:00Z"
+    },
+    "punch_out": {
+      "$date": "2026-07-07T01:10:00Z"
+    },
+    "work_hours": 8.75,
+    "late_minutes": 0,
+    "overtime_minutes": 40,
+    "half_day": false,
+    "history": []
+  },
+  {
+    "emp_code": "EMP0001",
+    "date": "2026-07-07",
+    "status": "PRESENT",
+    "punch_in": {
+      "$date": "2026-07-07T03:58:00Z"
+    },
+    "punch_out": {
+      "$date": "2026-07-07T13:00:00Z"
+    },
+    "work_hours": 9.03,
+    "late_minutes": 0,
+    "overtime_minutes": 0,
+    "half_day": false,
+    "history": [
+      {
+        "at": {
+          "$date": "2026-07-08T05:00:00Z"
+        },
+        "by": "hr.admin",
+        "reason": "biometric glitch",
+        "changes": {
+          "punch_in": {
+            "from": {
+              "$date": "2026-07-07T04:35:00Z"
+            },
+            "to": {
+              "$date": "2026-07-07T03:58:00Z"
+            }
+          },
+          "late_minutes": {
+            "from": 35,
+            "to": 0
+          },
+          "work_hours": {
+            "from": 8.42,
+            "to": 9.03
+          }
+        }
+      }
+    ]
+  },
+  {
+    "emp_code": "EMP0002",
+    "date": "2026-07-14",
+    "status": "PRESENT",
+    "punch_in": {
+      "$date": "2026-07-14T04:02:00Z"
+    },
+    "punch_out": {
+      "$date": "2026-07-14T13:01:00Z"
+    },
+    "work_hours": 8.98,
+    "late_minutes": 0,
+    "overtime_minutes": 0
+  }
+]
+======================================================================
+FILE: sample_data\employees.json
+======================================================================
+[
+  {
+    "emp_code": "EMP0001",
+    "name": "Asha Rao",
+    "email": "asha@example.com",
+    "department": "Engineering",
+    "shift_start": "09:30",
+    "shift_end": "18:30",
+    "joined_on": "2026-01-05",
+    "created_at": {
+      "$date": "2026-01-05T04:30:00Z"
+    }
+  },
+  {
+    "emp_code": "EMP0002",
+    "name": "Vikram Shah",
+    "email": "vikram@example.com",
+    "department": "Engineering",
+    "shift_start": "09:30",
+    "shift_end": "18:30",
+    "joined_on": "2026-07-13",
+    "created_at": {
+      "$date": "2026-07-13T04:00:00Z"
+    }
+  },
+  {
+    "emp_code": "EMP0003",
+    "name": "Neha Iyer",
+    "email": "neha@example.com",
+    "department": "Sales",
+    "shift_start": "09:30",
+    "shift_end": "18:30",
+    "joined_on": "2026-02-01",
+    "created_at": {
+      "$date": "2026-02-01T04:30:00Z"
+    }
+  },
+  {
+    "emp_code": "EMP0004",
+    "name": "Rohit Das",
+    "email": "rohit@example.com",
+    "department": "Sales",
+    "shift_start": "09:30",
+    "shift_end": "18:30",
+    "joined_on": "2026-02-01",
+    "created_at": {
+      "$date": "2026-02-01T04:31:00Z"
+    }
+  },
+  {
+    "emp_code": "EMP0005",
+    "name": "Meera Nair",
+    "email": "meera@example.com",
+    "department": "Support",
+    "shift_start": "22:00",
+    "shift_end": "06:00",
+    "joined_on": "2026-03-10",
+    "created_at": {
+      "$date": "2026-03-10T04:30:00Z"
+    }
+  },
+  {
+    "emp_code": "EMP0006",
+    "name": "Karan Bedi",
+    "email": "karan@example.com",
+    "department": "Support",
+    "shift_start": "09:30",
+    "shift_end": "18:30",
+    "joined_on": "2026-03-10",
+    "created_at": {
+      "$date": "2026-03-10T04:31:00Z"
+    }
+  }
+]
