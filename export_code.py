@@ -7,7 +7,7 @@ output_file = "project_code.txt"
 include_extensions = {
     ".py", ".js", ".ts", ".html", ".css",
     ".cpp", ".c", ".java", ".json", ".docx",
-    ".md", ".yaml"
+    ".md", ".yaml", ".env"
 }
 
 # Folders to ignore
