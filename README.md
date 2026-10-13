@@ -1,26 +1,56 @@
-# Candidate kit
+# Employee Attendance & Analytics API
 
-Read in this order:
+FastAPI + MongoDB backend for the HROne attendance assignment.
 
-1. `PROBLEM_STATEMENT.docx`: what you are asked to do, how it is evaluated.
-2. `openapi.yaml`: the API contract and the business rules (R1 - R10).
-3. `DATA_MODEL.md`: what is stored in MongoDB, with nine sample documents.
-4. `app/main.py`: the starter. Put **all** your code in this one file. It must start with `uvicorn app.main:app --port 8000`.
-5. `REVIEW.md`, `DECISIONS.md`: templates to fill in.
+## Requirements
 
-`sample_data/` holds the nine sample documents as MongoDB Extended JSON; `sample_seed.py` loads them. The grader's dataset is
-much larger and contains cases they do not show.
+- Python 3.11+
+- MongoDB 6.0+ (I tested against 7.0 via Docker)
 
-## Local setup
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env            # set MONGO_URI / MONGO_DB (local docker: docker run -p 27017:27017 mongo:7)
-python sample_seed.py
-uvicorn app.main:app --port 8000 --reload
-```
-MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free tier (M0) works.
+## Run
 
-## Submit
-A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
-No `.env`, no secrets, no Dockerfile.
+    python -m venv .venv
+    .venv\Scripts\activate
+    pip install -r requirements.txt
+
+    $env:MONGO_URI = "mongodb://127.0.0.1:27017"
+    $env:MONGO_DB  = "attendance_db"
+    uvicorn app.main:app --port 8000
+
+A local `.env` works too; real environment variables take priority. On Windows,
+prefer `127.0.0.1` over `localhost` if Mongo runs in Docker — the IPv6 path is
+unreliable.
+
+Verify the app is up:
+
+    curl.exe -s http://127.0.0.1:8000/health
+
+Expected: `{"status":"ok"}`. Returns 503 within a couple of seconds if MongoDB is
+unreachable, so the 20-second readiness window is never at risk.
+
+Interactive docs: `http://127.0.0.1:8000/docs`.
+
+## Files
+
+- `app/main.py` — all routes, validation, calculations, MongoDB access, analytics.
+- `requirements.txt`
+- `REVIEW.md` — defects found in the starter and how they were fixed.
+- `DECISIONS.md` — answers to the five questions.
+
+## Notes
+
+Indexes are created on startup, idempotently. If MongoDB is down, startup still
+completes and `/health` returns 503 rather than failing the boot.
+
+I verified all five `/admin/explain/*` endpoints against ~100k attendance rows:
+every plan reports IXSCAN and no COLLSCAN.
+
+## Verification
+
+No automated tests are shipped. I verified the endpoints manually with curl:
+CRUD flows, duplicate-punch 409s, concurrent punch-out, regularization history,
+all four analytics endpoints, and the explain plans on the 100k dataset.
+
+## What is missing
+
+Nothing against the OpenAPI contract as far as I know.
